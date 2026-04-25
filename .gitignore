@@ -9,3 +9,12 @@
 # VSCode
 .vscode/
 *.code-workspace
+
+# Environment files
+mzinga-apps/.env
+lab1-worker/.env
+
+# Python
+lab1-worker/.venv/
+lab1-worker/__pycache__/
+lab1-worker/*.pyc
