@@ -11,10 +11,12 @@
 *.code-workspace
 
 # Environment files
-mzinga-apps/.env
-lab1-worker/.env
+*/.env
 
 # Python
 lab1-worker/.venv/
 lab1-worker/__pycache__/
 lab1-worker/*.pyc
+lab2-worker-rest/.venv/
+lab2-worker-rest/__pycache__/
+lab2-worker-rest/*.pyc
