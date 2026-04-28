@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import time
 import smtplib
@@ -5,6 +7,7 @@ import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import aio_pika
 import requests
 from dotenv import load_dotenv
 
@@ -23,6 +26,10 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
 SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "1025"))
 EMAIL_FROM = os.getenv("EMAIL_FROM", "worker@mzinga.io")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL")
+ROUTING_KEY = os.getenv("ROUTING_KEY")
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME")
+QUEUE_NAME = os.getenv("QUEUE_NAME")
 
 # Authentication
 def authenticate() -> str:
@@ -68,7 +75,6 @@ def patch_status(token: str, doc_id: str, status: str):
         raise PermissionError("401")
     response.raise_for_status()
 
-# Slate AST → HTML serializer
 def serialize_node(node: dict) -> str:
     if "text" in node:
         text = node["text"]
@@ -122,7 +128,6 @@ def extract_emails(relationships: list) -> list[str]:
                 emails.append(email)
     return emails
 
-# Email sending
 def send_email(to_list: list, cc_list: list, bcc_list: list, subject: str, html: str):
     msg = MIMEMultipart("alternative")
     msg["From"] = EMAIL_FROM
@@ -139,7 +144,6 @@ def send_email(to_list: list, cc_list: list, bcc_list: list, subject: str, html:
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
 
-# Document processing
 def process_document(token: str, doc: dict) -> str:
     doc_id = doc["id"]
     log.info("Processing document %s", doc_id)
@@ -179,11 +183,8 @@ def process_document(token: str, doc: dict) -> str:
         except PermissionError:
             token = authenticate()
             patch_status(token, doc_id, "failed")
-
-    return token
-
-# Main poll loop
-def main():
+    
+def poll_main():
     token = authenticate()
 
     log.info("Worker started — polling every %s seconds", POLL_INTERVAL)
@@ -207,5 +208,73 @@ def main():
             time.sleep(POLL_INTERVAL)
 
 
+# Event-driven main loop (Part B)
+async def event_main():
+    token = authenticate()
+
+    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=1)
+
+        exchange = await channel.declare_exchange(
+            EXCHANGE_NAME, aio_pika.ExchangeType.TOPIC,
+            durable=True, internal=True, auto_delete=False,
+        )
+
+        queue = await channel.declare_queue(QUEUE_NAME, durable=True)
+        await queue.bind(exchange, routing_key=ROUTING_KEY)
+
+        log.info(f"Subscribed to {EXCHANGE_NAME} with key {ROUTING_KEY}. Waiting for messages.")
+
+        async with queue.iterator() as messages:
+            async for message in messages:
+                async with message.process(requeue=True):
+                    try:
+                        body = json.loads(message.body.decode())
+                        event_data = body.get("data", {})
+                        operation = event_data.get("operation")
+                        doc_id = (event_data.get("doc") or {}).get("id")
+
+                        if not doc_id:
+                            log.warning("Message missing doc.id, skipping")
+                            continue
+
+                        if operation != "create":
+                            log.debug(f"Ignoring operation={operation} for {doc_id}")
+                            continue
+
+                        response = requests.get(
+                            f"{MZINGA_URL}/api/communications/{doc_id}",
+                            params={"depth": 1},
+                            headers=make_headers(token),
+                        )
+                        if response.status_code == 401:
+                            log.warning("Token expired, re-authenticating")
+                            token = authenticate()
+                            raise PermissionError("401")
+                        response.raise_for_status()
+                        doc = response.json()
+                        token = process_document(token, doc)
+
+                    except requests.HTTPError as e:
+                        if e.response.status_code == 401:
+                            log.warning("Token expired, re-authenticating")
+                            token = authenticate()
+                            raise
+                        else:
+                            log.error(f"HTTP error processing message: {e}")
+                            raise
+                    except PermissionError:
+                        log.warning("Token expired, re-authenticating...")
+                        token = authenticate()
+                        raise
+
+
 if __name__ == "__main__":
-    main()
+    if RABBITMQ_URL and ROUTING_KEY and EXCHANGE_NAME and QUEUE_NAME:
+        log.info("RabbitMQ environment detected — starting in event-driven mode")
+        asyncio.run(event_main())
+    else:
+        log.info("Polling environment — starting in polling mode")
+        poll_main()
